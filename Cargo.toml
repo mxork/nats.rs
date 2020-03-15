@@ -26,11 +26,17 @@ nuid = "~0.2"
 lazy_static = "1.4"
 nom = "5.1"
 crossbeam-channel = "0.4"
+prost = "0.6"
+# Only necessary if using Protobuf well-known types:
+# prost-types = "0.6"
 
 [dev-dependencies]
 criterion = "0.3"
 quicli = "0.4"
 structopt = "0.3.5"
+
+[build-dependencies]
+prost-build = "0.6"
 
 [[bench]]
 name = "nats_bench"
