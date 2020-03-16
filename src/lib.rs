@@ -20,6 +20,9 @@ use std::{fmt, str, thread};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "streaming")]
+pub mod streaming;
+
 mod parser;
 
 #[deny(unsafe_code)]
