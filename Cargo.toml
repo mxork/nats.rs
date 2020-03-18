@@ -20,7 +20,7 @@ maintenance = { status = "actively-developed" }
 
 [features]
 default = []
-streaming = []
+streaming = [ "async-std" ]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -31,6 +31,7 @@ lazy_static = "1.4"
 nom = "5.1"
 crossbeam-channel = "0.4"
 prost = "0.6"
+async-std = { version = "*", optional = true }
 # Only necessary if using Protobuf well-known types:
 # prost-types = "0.6"
 

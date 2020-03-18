@@ -429,6 +429,7 @@ impl fmt::Display for Message {
     }
 }
 
+// :consider keep a copy of "subject"?
 #[derive(Clone, Debug)]
 pub struct Subscription {
     sid: usize,
