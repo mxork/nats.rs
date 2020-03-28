@@ -1,11 +1,13 @@
 use crate as nats;
 
-use async_std::task;
+use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize};
 
 use std::io;
 use std::time::Duration;
+
+use crossbeam_channel as channel;
 
 use prost::{
     Message as _,
@@ -27,7 +29,8 @@ impl ConnectionState for NotConnected {}
 impl ConnectionState for Connected {}
 
 #[doc(hidden)]
-pub struct NotConnected{}
+pub struct NotConnected {
+}
 
 
 pub struct Subscription {
@@ -55,11 +58,11 @@ use std::collections::HashMap;
 #[doc(hidden)]
 pub struct Connected {
     // its weird these aren't in the subscription
-    heartbeat_inbox: String,
-    heartbeat_sub: nats::Subscription,
+    // heartbeat_inbox: String,
+    // heartbeat_sub: nats::Subscription,
 
-    ping_inbox: String,
-    ping_sub: nats::Subscription,
+    // ping_inbox: String,
+    // ping_sub: nats::Subscription,
 
     // subs: HashMap<usize, >
 }
@@ -112,23 +115,26 @@ pub struct Options {
 // underlying conn not-Connected => T not-Connected
 #[derive(Debug)]
 pub struct Connection<S: nats::ConnectionState, T: ConnectionState> {
-    pub conn: nats::Connection<S>,
+    pub conn: Arc<Mutex<nats::Connection<S>>>,
 
     // :consider nest this struct or flatten to direct fields?
     options: Options,
     state: T,
 }
 
+pub fn upgrade_nats_connection(conn: nats::Connection<nats::Connected>)
+    -> Connection<nats::Connected, NotConnected>
+{
+    Connection{
+        conn: Arc::new(Mutex::new(conn)),
+        options: Options::default(),
+        state: NotConnected{},
+    }
+}
+
 impl Connection<nats::Connected, NotConnected> {
     // wrap an existing nats connection
     // :testme can you invoke this as just Connection::from_nats_connection
-    pub fn from_nats_connection(conn: nats::Connection<nats::Connected>) -> Self {
-        Connection{
-            conn: conn,
-            options: Options::default(),
-            state: NotConnected{},
-        }
-    }
 
     // BUILDER these? or params to connect?
     //
@@ -144,7 +150,8 @@ impl Connection<nats::Connected, NotConnected> {
 
     // upgrade bare NATS connection to streaming
     pub fn connect(self, cluster_id: impl AsRef<str>, client_id: impl AsRef<str>) -> io::Result<Connection<nats::Connected, Connected>> {
-        // :todo store all  these vars in Connection
+        eprintln!("top");
+        let conn = (&self.conn).lock().unwrap();
 
         // :check you can have a stan clientid distinct from nats clientid
         // get owned copies
@@ -154,22 +161,15 @@ impl Connection<nats::Connected, NotConnected> {
         let conn_id = nuid::next();
         let publish_nuid = nuid::NUID::new();
 
+        eprintln!("hb");
         // we respond to heartbeat with empty msg (OK)
-        let heartbeat_inbox = self.conn.new_inbox();
-        let heartbeat_sub = self.conn.subscribe(&heartbeat_inbox)?;
-        let heartbeat_handler = task::spawn(async move {
-            let sub = heartbeat_sub;
-            loop {
-                // unwrap: connection closed
-                let msg = sub.next().unwrap();
-                msg.respond(&[]).map_err(|e| eprintln!("error in heartbeat respond {}", e));
-            }
-        });
-
-        // let heartbeat_sub = self.conn.
-        //     subscribe(&heartbeat_inbox)?
-        //     .with_handler(|msg| msg.respond(&[]))
-        //     ;
+        let heartbeat_inbox = conn.new_inbox();
+        let heartbeat_sub = conn
+            .subscribe(&heartbeat_inbox)?
+            .with_handler(|msg| {
+                eprintln!("hb");
+                msg.respond(&[])
+            });
 
         // server replies to our ping requests with:
         //
@@ -178,33 +178,22 @@ impl Connection<nats::Connected, NotConnected> {
         //
         //  :consider create Handler trait instead of shoving
         //  everything into an opaque function
-        let ping_inbox = self.conn.new_inbox();
-        let ping_sub = self.conn.subscribe(&ping_inbox)?;
-        // ping handler set up after connection response
+        let ping_inbox = conn.new_inbox();
+        let ping_sub = conn.subscribe(&ping_inbox)?;
+        // set up handler later
 
-            // .with_handler(move |msg| {
-            //     if msg.data.is_empty() {
-            //         // reset ping counter
-            //         return
-            //     }
-
-            //     // otherwise
-            //     // increment ping counter
-            //     // fail on exceed ping
-            // })
-            // ;
-
-        let discover_subject = format!("{}.{}",
-                                       self.options.discover_prefix,
+        let discover_subject = format!("_STAN.discover.{}",
+                                       // self.options.discover_prefix,
                                        cluster_id,
                                        );
 
+        eprintln!("{}", discover_subject);
 
         let connect_request = pb::ConnectRequest{
             client_id: client_id.clone(),
             heartbeat_inbox: heartbeat_inbox.clone(),
             protocol: 1,
-            conn_id: conn_id.into_bytes(),
+            conn_id: conn_id.clone().into_bytes(),
             ping_interval: self.options.ping_interval,
             ping_max_out: self.options.ping_max_out,
         };
@@ -215,15 +204,16 @@ impl Connection<nats::Connected, NotConnected> {
             b
         };
 
+        eprintln!("cr");
         let connect_response = {
-            let buf = self.conn.request(&discover_subject,
+            let buf = conn.request(&discover_subject,
                                   &connect_request_encoded,
                                   )?.data;
 
             pb::ConnectResponse::decode(io::Cursor::new(buf))?
         };
 
-        unimplemented!();
+        eprintln!("Connect response: {:#?}", connect_response);
 
         // Capture cluster configuration endpoints to publish and subscribe/unsubscribe.
         // c.pubPrefix = cr.PubPrefix
@@ -233,8 +223,9 @@ impl Connection<nats::Connected, NotConnected> {
         // c.closeRequests = cr.CloseRequests
 
         // Setup the ACK subscription
+        eprintln!("ack");
         let ack_subject = format!("{}.{}", DEFAULT_ACK_PREFIX, nuid::next());
-        let ack_sub = self.conn.subscribe(&ack_subject)?;
+        let ack_sub = conn.subscribe(&ack_subject)?;
         // c.ackSubscription.SetPendingLimits(1024*1024, 32*1024*1024)
         // Setup Publish Acker
 
@@ -245,40 +236,99 @@ impl Connection<nats::Connected, NotConnected> {
 
         // assume we don't have to deal with this for now
         // Protocol v1 ping stuff; let server dictate parameters
-        assert!(
-            connect_response.protocol >= 1 && connect_response.ping_interval != 0,
-            "server looks too old for us",
-            );
+        // I get ping interval 0 on v0.17.0
+        // assert!(
+        //     connect_response.protocol >= 1 && connect_response.ping_interval != 0,
+        //     "server looks too old for us {:?}",
+        //     connect_response
+        //     );
+        //
+        //
+        //     You can ignore pings for now.
 
         let ping_requests = connect_response.ping_requests;
 
         // in tests, ping interval is allowed to be negative!
-        assert!(connect_response.ping_interval > 0);
-        let ping_interval = Duration::from_secs(connect_response.ping_interval as u64);
+        // assert!(connect_response.ping_interval > 0);
+        let ping_interval = Duration::from_secs(5); // Duration::from_secs(connect_response.ping_interval as u64);
 
         // precooked ping msg
-        let ping_bytes = {
+        let ping_msg = {
             let mut buf = Vec::new();
-            pb::Ping{conn_id: conn_id.into_bytes()}.encode(&mut buf)?; // always succeeds
+            pb::Ping{conn_id: conn_id.clone().into_bytes()}.encode(&mut buf)?; // always succeeds
             buf
         };
 
         // turn on pinger
-        let ping_handler = task::spawn(async move {
-            let sub = ping_sub;
-            let interval = ping_interval;
-            let mut ping_out = 0;
-            loop {
-                ping_out += 1;
-                task::sleep(interval);
+        {
+            enum P {
+                Reply,
+                Tick,
             }
-        });
 
-        // Ok(Connection{
-        //     conn: self.conn,
-        //     options: self.options,
-        //     state: Connected{},
-        // })
+            // :fixme
+            let (s, r) = channel::bounded(2);
+            let s_ticker = s.clone();
+            let s_receiver = s.clone();
+
+            let ticker = thread::spawn(move || {
+                let s = s_ticker;
+                let interval = ping_interval;
+
+                loop {
+                    eprintln!("tick");
+                    s.send(P::Tick);
+                    thread::sleep(interval);
+                }
+            });
+
+            let receiver = thread::spawn(move || {
+                let s = s_receiver;
+                let sub = ping_sub;
+
+                loop {
+                    // :fixme
+                    let r = sub.next().unwrap();
+                    eprintln!("ping recv");
+                    s.send(P::Reply).unwrap();
+                }
+            });
+
+            let conn_sender = self.conn.clone();
+            let sender = thread::spawn(move || {
+                let conn = conn_sender;
+                let msg = ping_msg;
+                let interval = ping_interval;
+                let mut counter = 0;
+
+                loop {
+                    // :fixme
+                    match r.recv().unwrap() {
+                        P::Tick => {
+                            // :fixme max ping
+                            if counter == 2 {
+                                panic!("exceeded max ping");
+                            }
+                            counter += 1;
+
+                            eprintln!("pub");
+                            conn.lock().unwrap()
+                                .publish(&ping_requests, &msg).unwrap();
+                        },
+
+                        P::Reply => counter -= 1,
+                    }
+                }
+            });
+        }
+
+        drop(conn);
+
+        Ok(Connection{
+            conn: self.conn,
+            options: self.options,
+            state: Connected{},
+        })
     }
 }
 
