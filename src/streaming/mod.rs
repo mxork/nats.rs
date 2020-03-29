@@ -1,11 +1,17 @@
 use crate as nats;
 
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize};
+type ArcMut<T> = Arc<Mutex<T>>;
+type ArcLock<T> = Arc<RwLock<T>>;
+
+use std::collections::{HashMap as Map};
 
 use std::io;
 use std::time::Duration;
+
+use log::{trace};
 
 use crossbeam_channel as channel;
 
@@ -18,185 +24,121 @@ use pb::{
     MsgProto as Message,
 };
 
+static DEFAULT_DISCOVER_PREFIX: &str = "_STAN.discover";
+static DEFAULT_ACK_PREFIX: &str = "_STAN.acks";
+
 pub trait ConnectionState: private::Sealed {}
 mod private {
     pub trait Sealed {}
     impl Sealed for super::NotConnected {}
+    impl Sealed for super::ConnectedNotStreaming {}
     impl Sealed for super::Connected {}
 }
 
 impl ConnectionState for NotConnected {}
+impl ConnectionState for ConnectedNotStreaming {}
 impl ConnectionState for Connected {}
 
 #[doc(hidden)]
-pub struct NotConnected {
+pub struct NotConnected {}
+
+#[doc(hidden)]
+pub struct ConnectedNotStreaming {
+    nats: nats::Connection<nats::Connected>,
 }
 
-
-pub struct Subscription {
-    sub: nats::Subscription,
-}
-
-static DEFAULT_DISCOVER_PREFIX: &str = "_STAN.discover";
-static DEFAULT_ACK_PREFIX: &str = "_STAN.acks";
-
-// // helper
-// fn prost_decode<T>(v: Vec<u8>)
-
-// derive this noise
-impl Subscription {
-    pub fn next(&self) -> Option<Message> {
-        self.sub.recv
-            .iter()
-            .next()
-            .map(|msg| pb::MsgProto::decode(io::Cursor::new(msg.data))
-                 .expect("msg in streaming inbox did not contain valid MsgProto"))
-    }
-}
-
-use std::collections::HashMap;
 #[doc(hidden)]
 pub struct Connected {
-    // its weird these aren't in the subscription
-    // heartbeat_inbox: String,
-    // heartbeat_sub: nats::Subscription,
-
-    // ping_inbox: String,
-    // ping_sub: nats::Subscription,
-
-    // subs: HashMap<usize, >
+    shared: ArcLock<SharedConnected>,
 }
 
-#[derive(Debug,Default)]
-pub struct Options {
-		// NatsURL:            DefaultNatsURL,
-		// ConnectTimeout:     DefaultConnectWait,
-		// AckTimeout:         DefaultAckWait,
-		// DiscoverPrefix:     DefaultDiscoverPrefix,
-		// MaxPubAcksInflight: DefaultMaxPubAcksInflight,
-		// PingIterval:        DefaultPingInterval,
-		// PingMaxOut:         DefaultPingMaxOut,
-
+struct SharedConnected {
     cluster_id: String,
     client_id: String,
+    conn_id: String,
 
-    // :todo Default this to correct
-    discover_prefix: String,
+    connect_response: pb::ConnectResponse,
 
-    // :todo Add these options, and add with_* to Connect<NotConnected>
-    //
-	// ConnectTimeout time.Duration
-
-	// AckTimeout is how long to wait when a message is published for an ACK from
-	// the cluster. If the library does not receive an ACK after this timeout,
-	// the Publish() call (or the AckHandler) will return ErrTimeout.
-	// AckTimeout time.Duration
-
-	// DiscoverPrefix is the prefix connect requests are sent to for this cluster.
-	// The default is "_STAN.discover".
-	// DiscoverPrefix string
-
-	// MaxPubAcksInflight specifies how many messages can be published without
-	// getting ACKs back from the cluster before the Publish() or PublishAsync()
-	// calls block.
-	// MaxPubAcksInflight int
-
-	// PingInterval is the interval at which client sends PINGs to the server
-	// to detect the loss of a connection.
-	// PingIterval int
-    ping_interval: i32,
-
-	// PingMaxOut specifies the maximum number of PINGs without a corresponding
-	// PONG before declaring the connection permanently lost.
-	// PingMaxOut int
-    ping_max_out: i32,
+    nats: nats::Connection<nats::Connected>,
+    subscriptions: Map<String, channel::Sender<Message>>,
 }
 
 // underlying conn not-Connected => T not-Connected
 #[derive(Debug)]
-pub struct Connection<S: nats::ConnectionState, T: ConnectionState> {
-    pub conn: Arc<Mutex<nats::Connection<S>>>,
-
-    // :consider nest this struct or flatten to direct fields?
-    options: Options,
+pub struct Connection<T: ConnectionState> {
     state: T,
 }
 
-pub fn upgrade_nats_connection(conn: nats::Connection<nats::Connected>)
-    -> Connection<nats::Connected, NotConnected>
+pub fn from_nats(conn: nats::Connection<nats::Connected>)
+    -> Connection<ConnectedNotStreaming>
 {
     Connection{
-        conn: Arc::new(Mutex::new(conn)),
-        options: Options::default(),
-        state: NotConnected{},
+        state: ConnectedNotStreaming{
+            nats: conn,
+        },
     }
 }
 
-impl Connection<nats::Connected, NotConnected> {
-    // wrap an existing nats connection
-    // :testme can you invoke this as just Connection::from_nats_connection
-
-    // BUILDER these? or params to connect?
-    //
-    // pub fn with_cluster_id<T: Into<String>>(self, cluster_id: T) -> Self {
-    //     self.options.cluster_id = cluster_id.into();
-    //     self
-    // }
-
-    // pub fn with_client_id<T: Into<String>>(self, client_id: T) -> Self {
-    //     self.options.client_id = client_id.into();
-    //     self
-    // }
-
+impl Connection<ConnectedNotStreaming> {
     // upgrade bare NATS connection to streaming
-    pub fn connect(self, cluster_id: impl AsRef<str>, client_id: impl AsRef<str>) -> io::Result<Connection<nats::Connected, Connected>> {
-        eprintln!("top");
-        let conn = (&self.conn).lock().unwrap();
+    pub fn upgrade_to_streaming(self, cluster_id: impl AsRef<str>, client_id: impl AsRef<str>) -> io::Result<Connection<Connected>> {
+        let conn_shared = Arc::new(RwLock::new(
+                SharedConnected {
+                    cluster_id: cluster_id.as_ref().to_owned(),
+                    client_id: client_id.as_ref().to_owned(),
+                    conn_id: nuid::next(),
+
+                    // will overwrite this on success
+                    connect_response: pb::ConnectResponse::default(),
+
+                    nats: self.state.nats,
+                    subscriptions: Map::new(),
+                }
+        ));
+
+        let conn_arc = conn_shared.clone();
+        let mut conn_l = conn_arc.write().unwrap();
+        let conn = &conn_l.nats;
 
         // :check you can have a stan clientid distinct from nats clientid
         // get owned copies
         let cluster_id = cluster_id.as_ref().to_owned();
-        let client_id = client_id.as_ref().to_owned();
+        trace!("using cluster id: {}", cluster_id);
 
-        let conn_id = nuid::next();
+        let client_id = client_id.as_ref().to_owned();
+        trace!("using client id: {}", client_id);
+
+        let conn_id = conn_l.conn_id.clone();
+        trace!("using connection id: {}", conn_id);
+
         let publish_nuid = nuid::NUID::new();
 
-        eprintln!("hb");
         // we respond to heartbeat with empty msg (OK)
         let heartbeat_inbox = conn.new_inbox();
         let heartbeat_sub = conn
             .subscribe(&heartbeat_inbox)?
             .with_handler(|msg| {
-                eprintln!("hb");
+                trace!("received heartbeat request.");
                 msg.respond(&[])
             });
 
-        // server replies to our ping requests with:
-        //
-        //   1. empty msg (OK) => reset no ping counter
-        //   2. msg with nonempty Error => connection is closed
-        //
-        //  :consider create Handler trait instead of shoving
-        //  everything into an opaque function
-        let ping_inbox = conn.new_inbox();
-        let ping_sub = conn.subscribe(&ping_inbox)?;
-        // set up handler later
-
-        let discover_subject = format!("_STAN.discover.{}",
-                                       // self.options.discover_prefix,
+        let discover_subject = format!("{}.{}",
+                                       DEFAULT_DISCOVER_PREFIX,
                                        cluster_id,
                                        );
-
-        eprintln!("{}", discover_subject);
 
         let connect_request = pb::ConnectRequest{
             client_id: client_id.clone(),
             heartbeat_inbox: heartbeat_inbox.clone(),
             protocol: 1,
             conn_id: conn_id.clone().into_bytes(),
-            ping_interval: self.options.ping_interval,
-            ping_max_out: self.options.ping_max_out,
+            ..pb::ConnectRequest::default()
+            // :todo(ping)
+            // ping_interval: self.options.ping_interval,
+            // ping_max_out: self.options.ping_max_out,
         };
+
+        trace!("sending ConnectRequest: {:#?}", connect_request);
 
         let connect_request_encoded = {
             let mut b = Vec::new();
@@ -204,7 +146,6 @@ impl Connection<nats::Connected, NotConnected> {
             b
         };
 
-        eprintln!("cr");
         let connect_response = {
             let buf = conn.request(&discover_subject,
                                   &connect_request_encoded,
@@ -213,7 +154,7 @@ impl Connection<nats::Connected, NotConnected> {
             pb::ConnectResponse::decode(io::Cursor::new(buf))?
         };
 
-        eprintln!("Connect response: {:#?}", connect_response);
+        trace!("received ConnectResponse: {:#?}", connect_response);
 
         // Capture cluster configuration endpoints to publish and subscribe/unsubscribe.
         // c.pubPrefix = cr.PubPrefix
@@ -223,125 +164,81 @@ impl Connection<nats::Connected, NotConnected> {
         // c.closeRequests = cr.CloseRequests
 
         // Setup the ACK subscription
-        eprintln!("ack");
+        // :note stan.go does not allow config of DefaultAck
         let ack_subject = format!("{}.{}", DEFAULT_ACK_PREFIX, nuid::next());
         let ack_sub = conn.subscribe(&ack_subject)?;
         // c.ackSubscription.SetPendingLimits(1024*1024, 32*1024*1024)
-        // Setup Publish Acker
 
         // Create Subscription map
         // let subs = Arc::new(Mutex::new(HashMap<usize, _>::new()));
 
-        // :skip Capture the connection error cb
+        assert!(connect_response.protocol >= 1,
+                "server looks too old for us. ConnectResponse: {:#?}",
+                connect_response);
 
-        // assume we don't have to deal with this for now
-        // Protocol v1 ping stuff; let server dictate parameters
-        // I get ping interval 0 on v0.17.0
-        // assert!(
-        //     connect_response.protocol >= 1 && connect_response.ping_interval != 0,
-        //     "server looks too old for us {:?}",
-        //     connect_response
-        //     );
-        //
-        //
-        //     You can ignore pings for now.
-
-        let ping_requests = connect_response.ping_requests;
-
-        // in tests, ping interval is allowed to be negative!
-        // assert!(connect_response.ping_interval > 0);
-        let ping_interval = Duration::from_secs(5); // Duration::from_secs(connect_response.ping_interval as u64);
-
-        // precooked ping msg
-        let ping_msg = {
-            let mut buf = Vec::new();
-            pb::Ping{conn_id: conn_id.clone().into_bytes()}.encode(&mut buf)?; // always succeeds
-            buf
-        };
-
-        // turn on pinger
-        {
-            enum P {
-                Reply,
-                Tick,
-            }
-
-            // :fixme
-            let (s, r) = channel::bounded(2);
-            let s_ticker = s.clone();
-            let s_receiver = s.clone();
-
-            let ticker = thread::spawn(move || {
-                let s = s_ticker;
-                let interval = ping_interval;
-
-                loop {
-                    eprintln!("tick");
-                    s.send(P::Tick);
-                    thread::sleep(interval);
-                }
-            });
-
-            let receiver = thread::spawn(move || {
-                let s = s_receiver;
-                let sub = ping_sub;
-
-                loop {
-                    // :fixme
-                    let r = sub.next().unwrap();
-                    eprintln!("ping recv");
-                    s.send(P::Reply).unwrap();
-                }
-            });
-
-            let conn_sender = self.conn.clone();
-            let sender = thread::spawn(move || {
-                let conn = conn_sender;
-                let msg = ping_msg;
-                let interval = ping_interval;
-                let mut counter = 0;
-
-                loop {
-                    // :fixme
-                    match r.recv().unwrap() {
-                        P::Tick => {
-                            // :fixme max ping
-                            if counter == 2 {
-                                panic!("exceeded max ping");
-                            }
-                            counter += 1;
-
-                            eprintln!("pub");
-                            conn.lock().unwrap()
-                                .publish(&ping_requests, &msg).unwrap();
-                        },
-
-                        P::Reply => counter -= 1,
-                    }
-                }
-            });
-        }
+        // :todo(ping)
+        // assume server asked for no pings (default v0.17.0)
+        // let ping_requests = connect_response.ping_requests;
+        assert!(connect_response.ping_interval == 0);
 
         drop(conn);
-
+        conn_l.connect_response = connect_response;
         Ok(Connection{
-            conn: self.conn,
-            options: self.options,
-            state: Connected{},
+            state: Connected{
+                shared: conn_shared,
+            },
         })
     }
 }
 
-// :todo not sure if we'll need our own Subscription type
-// type Subscription = nats::Subscription;
+fn encode_or_die<T: prost::Message+Sized>(m: T) -> Vec<u8> {
+    let mut b = Vec::new();
+    m.encode(&mut b).expect("failed to encode");
+    b
+}
 
-impl Connection<nats::Connected, Connected> {
+fn decode_or_die<T: prost::Message+Default>(b: Vec<u8>) -> T {
+    T::decode(io::Cursor::new(b)).expect("failed to decode")
+}
+
+impl Connection<Connected> {
     pub fn publish(subject: impl Into<String>, msg: impl AsRef<[u8]>) -> io::Result<()> {
         unimplemented!()
     }
 
-    pub fn subscribe() -> io::Result<Subscription> {
-        unimplemented!()
+    pub fn subscribe(&self, subject: &str) -> io::Result<Subscription> {
+        let shared = self.state.shared.write().unwrap();
+
+        let inbox = shared.nats.new_inbox();
+        let sub = shared.nats.subscribe(&inbox)?;
+
+        let subreq = pb::SubscriptionRequest{
+            client_id: shared.client_id.clone(),
+            subject: subject.to_owned(),
+            inbox: inbox.clone(),
+            ack_wait_in_secs: 30, // no default here
+            max_in_flight: 1,
+            ..pb::SubscriptionRequest::default()
+        };
+
+        let subreqcooked = encode_or_die(subreq);
+        let reply: pb::SubscriptionResponse = {
+            let reply = shared.nats.request(&shared.connect_response.sub_requests, subreqcooked)?;
+            decode_or_die(reply.data)
+        };
+
+        if !reply.error.is_empty() {
+            sub.unsubscribe();
+            return Err(io::Error::new(io::ErrorKind::Other, reply.error));
+        }
+
+        Ok(Subscription {
+            inbox,
+            ack_inbox: reply.ack_inbox,
+            subject: subject.to_owned(),
+            sub,
+            shared: self.state.shared.clone(),
+        })
     }
 
     // be graceful and always unsubscribe
@@ -359,3 +256,74 @@ impl Connection<nats::Connected, Connected> {
     }
 }
 
+pub struct Subscription {
+    inbox: String,
+    ack_inbox: String,
+    subject: String,
+
+    sub: nats::Subscription,
+    shared: ArcLock<SharedConnected>,
+}
+
+// derive this noise
+impl Subscription {
+    pub fn next(&self) -> Option<Message> {
+        trace!("receiving message");
+        self.sub.recv
+            .iter()
+            .next()
+            .map(|msg| pb::MsgProto::decode(io::Cursor::new(msg.data))
+                 .expect("msg in streaming inbox did not contain valid MsgProto"))
+    }
+
+    pub fn next_and_ack(&self) -> io::Result<Option<Message>> {
+        // :todo(manual ack)
+        let msg = match self.next() {
+            None => None,
+            Some(msg) => {
+                trace!("ack'ing message");
+                let ack = self.prepare_ack(&msg);
+                self.ack(&self.ack_inbox, ack)?;
+                Some(msg)
+            },
+        };
+
+        Ok(msg)
+    }
+
+    fn prepare_ack(&self, msg: &Message) -> Vec<u8> {
+        let msg = pb::Ack{subject: msg.subject.to_owned(), sequence: msg.sequence};
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).expect("failed to encode ack");
+        buf
+    }
+
+    pub fn ack(&self, ack_subject: &str, raw_ack: Vec<u8>) -> io::Result<()> {
+        self.shared.read().unwrap()
+            .nats.publish(ack_subject, raw_ack)
+    }
+
+    pub fn unsubscribe(&mut self) -> io::Result<()> {
+        let shared = self.shared.write().unwrap();
+        let req = encode_or_die(pb::UnsubscribeRequest{
+            client_id: shared.client_id.clone(),
+            subject: self.subject.clone(),
+            inbox: self.ack_inbox.clone(),
+            ..pb::UnsubscribeRequest::default()
+        });
+
+        let reply: pb::SubscriptionResponse = decode_or_die(shared.nats.request(&shared.connect_response.unsub_requests, req)?.data);
+
+        if !reply.error.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, reply.error));
+        };
+
+        Ok(())
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
